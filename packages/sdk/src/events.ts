@@ -1,5 +1,24 @@
 import { Buffer } from "buffer";
 import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
+import {
+  fetchEventsViaServer,
+  pollLooptagEvents,
+  type PollLooptagEventsOptions,
+  type PolledLooptagEventPage,
+} from "./events-poller.js";
+
+export {
+  DEFAULT_EVENT_PAGE_LIMIT,
+  MAX_EVENT_PAGE_LIMIT,
+  LooptagRpcError,
+  decodeRawEventBatch,
+  pollLooptagEvents,
+  type LooptagRpcErrorOptions,
+  type PollLooptagEventsOptions,
+  type PolledLooptagEvent,
+  type PolledLooptagEventPage,
+  type SkippedEventWarning,
+} from "./events-poller.js";
 
 export type LooptagEvent =
   | { type: "init"; admin: string; depositToken: string }
@@ -55,37 +74,46 @@ export function decodeLooptagEvent(
   value: xdr.ScVal,
 ): LooptagEvent | null {
   const name = topics[0] ? String(scValToNative(topics[0])) : "";
-  const data = scValToNative(value) as unknown[];
+  const rawData = scValToNative(value);
 
   switch (name) {
-    case "init":
+    case "init": {
+      const data = requireDataTuple(name, rawData, 1);
       return {
         type: "init",
-        admin: String(scValToNative(topics[1])),
+        admin: topicString(name, topics[1]),
         depositToken: String(data[0]),
       };
-    case "merchant_registered":
+    }
+    case "merchant_registered": {
+      const data = requireDataTuple(name, rawData, 2);
       return {
         type: "merchant_registered",
-        merchant: String(scValToNative(topics[1])),
+        merchant: topicString(name, topics[1]),
         name: String(data[0]),
         active: Boolean(data[1]),
       };
-    case "merchant_status_changed":
+    }
+    case "merchant_status_changed": {
+      const data = requireDataTuple(name, rawData, 2);
       return {
         type: "merchant_status_changed",
-        merchant: String(scValToNative(topics[1])),
+        merchant: topicString(name, topics[1]),
         name: String(data[0]),
         active: Boolean(data[1]),
       };
-    case "station_changed":
+    }
+    case "station_changed": {
+      const data = requireDataTuple(name, rawData, 2);
       return {
         type: "station_changed",
-        issuer: String(scValToNative(topics[1])),
+        issuer: topicString(name, topics[1]),
         station: String(data[0]),
         authorized: Boolean(data[1]),
       };
-    case "claim_issued":
+    }
+    case "claim_issued": {
+      const data = requireDataTuple(name, rawData, 5);
       return {
         type: "claim_issued",
         claimId: claimIdFromTopic(topics[1]),
@@ -95,53 +123,88 @@ export function decodeLooptagEvent(
         serialHash: toHex(data[3]),
         expiresAt: Number(data[4]),
       };
-    case "claim_transferred":
+    }
+    case "claim_transferred": {
+      const data = requireDataTuple(name, rawData, 2);
       return {
         type: "claim_transferred",
         claimId: claimIdFromTopic(topics[1]),
         from: String(data[0]),
         to: String(data[1]),
       };
-    case "return_authorized":
+    }
+    case "return_authorized": {
+      const data = requireDataTuple(name, rawData, 2);
       return {
         type: "return_authorized",
         claimId: claimIdFromTopic(topics[1]),
         station: String(data[0]),
         returnedAt: Number(data[1]),
       };
-    case "claim_redeemed":
+    }
+    case "claim_redeemed": {
+      const data = requireDataTuple(name, rawData, 2);
       return {
         type: "claim_redeemed",
         claimId: claimIdFromTopic(topics[1]),
         owner: String(data[0]),
         deposit: BigInt(data[1] as bigint),
       };
-    case "pause_changed":
+    }
+    case "pause_changed": {
+      const data = requireDataTuple(name, rawData, 1);
       return {
         type: "pause_changed",
-        admin: String(scValToNative(topics[1])),
+        admin: topicString(name, topics[1]),
         paused: Boolean(data[0]),
       };
-    case "admin_transfer_proposed":
+    }
+    case "admin_transfer_proposed": {
+      const data = requireDataTuple(name, rawData, 1);
       return {
         type: "admin_transfer_proposed",
-        admin: String(scValToNative(topics[1])),
+        admin: topicString(name, topics[1]),
         newAdmin: String(data[0]),
       };
-    case "admin_transfer_cancelled":
+    }
+    case "admin_transfer_cancelled": {
+      requireDataTuple(name, rawData, 0);
       return {
         type: "admin_transfer_cancelled",
-        admin: String(scValToNative(topics[1])),
+        admin: topicString(name, topics[1]),
       };
-    case "admin_changed":
+    }
+    case "admin_changed": {
+      const data = requireDataTuple(name, rawData, 1);
       return {
         type: "admin_changed",
-        oldAdmin: String(scValToNative(topics[1])),
+        oldAdmin: topicString(name, topics[1]),
         newAdmin: String(data[0]),
       };
+    }
     default:
       return null;
   }
+}
+
+function requireDataTuple(
+  eventName: string,
+  rawData: unknown,
+  minLength: number,
+): unknown[] {
+  if (!Array.isArray(rawData) || rawData.length < minLength) {
+    throw new TypeError(
+      `${eventName} event value must be an ScVec of length >= ${minLength}`,
+    );
+  }
+  return rawData;
+}
+
+function topicString(eventName: string, topic: xdr.ScVal | undefined): string {
+  if (!topic) {
+    throw new TypeError(`${eventName} event is missing its address topic`);
+  }
+  return String(scValToNative(topic));
 }
 
 function claimIdFromTopic(topic: xdr.ScVal | undefined): string {
@@ -192,68 +255,47 @@ export interface FetchLooptagEventsOptions {
 /**
  * Fetch and decode one page of LOOPTAG events from Soroban RPC.
  *
+ * Accepts either a direct `{ rpcUrl, contractId?, startLedger?, endLedger?, cursor?, limit?, fetchFn? }`
+ * configuration object or an existing `rpc.Server` instance plus `{ contractId, startLedger?, cursor?, limit? }`.
+ *
  * The function deliberately does not run a polling loop: callers can persist
  * `page.cursor`, schedule the next poll, or reconcile a gap after downtime.
- * Unknown events from future versions are ignored, not treated as errors.
+ * Unknown events from future versions are ignored, and malformed XDR payloads
+ * are isolated per event into `page.warnings` (`page.skipped`).
  */
+export async function fetchLooptagEvents(
+  options: PollLooptagEventsOptions,
+): Promise<PolledLooptagEventPage>;
 export async function fetchLooptagEvents(
   server: rpc.Server,
   options: FetchLooptagEventsOptions,
-): Promise<LooptagEventPage> {
-  const limit = options.limit ?? 100;
-  if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
-    throw new RangeError("limit must be an integer between 1 and 1000");
+): Promise<PolledLooptagEventPage>;
+export async function fetchLooptagEvents(
+  serverOrOptions: rpc.Server | PollLooptagEventsOptions,
+  maybeOptions?: FetchLooptagEventsOptions,
+): Promise<PolledLooptagEventPage> {
+  if (isPollOptions(serverOrOptions, maybeOptions)) {
+    return pollLooptagEvents(serverOrOptions);
   }
-  if (options.cursor && options.startLedger !== undefined) {
-    throw new TypeError("pass either cursor or startLedger, not both");
-  }
-  if (!options.cursor && options.startLedger === undefined) {
-    throw new TypeError("fetchLooptagEvents needs a cursor or startLedger");
-  }
-  if (
-    options.startLedger !== undefined &&
-    (!Number.isInteger(options.startLedger) || options.startLedger < 1)
-  ) {
-    throw new RangeError("startLedger must be a positive integer");
-  }
+  return fetchEventsViaServer(
+    serverOrOptions as rpc.Server,
+    maybeOptions as FetchLooptagEventsOptions,
+  );
+}
 
-  const filters = [
-    {
-      type: "contract" as const,
-      contractIds: [options.contractId],
-    },
-  ];
-  const request = options.cursor
-    ? { cursor: options.cursor, filters, limit }
-    : { startLedger: options.startLedger as number, filters, limit };
-
-  const response = await server.getEvents(request);
-  const events: DecodedLooptagEvent[] = [];
-
-  for (const rpcEvent of response.events) {
-    const eventContract = rpcEvent.contractId
-      ? String(rpcEvent.contractId)
-      : undefined;
-    if (eventContract && eventContract !== options.contractId) {
-      continue;
-    }
-    const decoded = decodeLooptagEvent(rpcEvent.topic, rpcEvent.value);
-    if (!decoded) {
-      continue;
-    }
-    events.push({
-      event: decoded,
-      id: rpcEvent.id,
-      ledger: rpcEvent.ledger,
-      ledgerClosedAt: rpcEvent.ledgerClosedAt,
-      txHash: rpcEvent.txHash,
-      contractId: eventContract,
-    });
+function isPollOptions(
+  serverOrOptions: rpc.Server | PollLooptagEventsOptions,
+  maybeOptions?: FetchLooptagEventsOptions,
+): serverOrOptions is PollLooptagEventsOptions {
+  if (maybeOptions !== undefined) {
+    return false;
   }
-
-  return {
-    events,
-    cursor: response.cursor,
-    latestLedger: response.latestLedger,
-  };
+  return (
+    typeof serverOrOptions === "object" &&
+    serverOrOptions !== null &&
+    !(
+      "getEvents" in serverOrOptions &&
+      typeof serverOrOptions.getEvents === "function"
+    )
+  );
 }
