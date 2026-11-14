@@ -96,11 +96,37 @@ the token transfer, so a re-entrant token cannot redeem twice.
 | `claim.ts` | status labels, transfer/redeem/overdue predicates, dashboard summary |
 | `client.ts` | typed client factory and Stellar Expert URL helpers |
 | `events.ts` | decode contract events into discriminated TypeScript unions |
+| `events-poller.ts` | cursor & ledger-window Soroban RPC `getEvents` poller with fault isolation |
 | `generated/index.ts` | bindings generated from the contract spec |
 
 The generated bindings are checked in so the SDK builds without a running
 Stellar CLI. Regenerate them after changing the contract interface (see
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
+
+#### Event polling, cursor persistence, and idempotency
+
+`fetchLooptagEvents` / `pollLooptagEvents` fetch a single bounded page from
+Soroban RPC `getEvents` rather than hiding a background timer inside the SDK:
+
+1. **Initial scan (`startLedger` / optional `endLedger`)**: On first boot with
+   no saved checkpoint, pass `startLedger` (and optionally `endLedger` for
+   bounded backfill). Note that Soroban RPC nodes only retain a rolling window
+   of recent ledgers (`oldestLedger` .. `latestLedger`, typically ~24h–7d
+   depending on the provider); historical gaps older than `oldestLedger` must be
+   backfilled from a ledger archive before switching to live RPC polling.
+2. **Steady-state polling (`cursor`)**: Persist `page.cursor` durably *after*
+   committing `page.events` in the same database transaction (or after an
+   idempotent upsert). Pass `{ cursor: savedCursor }` on the next call (`cursor`
+   cannot be combined with `startLedger` or `endLedger` per Soroban RPC rules).
+   When `page.hasMore` is `true`, immediately fetch the next page with
+   `page.cursor` before sleeping until the next poll interval.
+3. **Consumer idempotency**: Crash recovery between processing events and
+   persisting `page.cursor` can replay the last page. Consumers should key
+   deduplication on `event.id` (the globally unique Soroban event paging token)
+   — or `(txHash, event.id)` — so re-delivering an already-indexed event is a
+   safe no-op. Malformed XDR payloads on a page are isolated into
+   `page.warnings` (`page.skipped`) so a single corrupt entry never stalls
+   cursor advancement.
 
 ### 4. Demo dashboard (`demo`)
 
