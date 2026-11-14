@@ -12,9 +12,12 @@
 //! was returned. That fact is attested by an authorised station. See
 //! `docs/TRUST_MODEL.md` for the full trust model.
 
+#[cfg(test)]
+extern crate std;
+
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, Address, BytesN,
-    Env, String,
+    Env, String, Vec,
 };
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -22,6 +25,10 @@ const INSTANCE_LIFETIME: u32 = 30 * DAY_IN_LEDGERS;
 const INSTANCE_THRESHOLD: u32 = INSTANCE_LIFETIME - DAY_IN_LEDGERS;
 const CLAIM_LIFETIME: u32 = 180 * DAY_IN_LEDGERS;
 const CLAIM_THRESHOLD: u32 = CLAIM_LIFETIME - DAY_IN_LEDGERS;
+
+/// Upper bound on `get_claims` so a dashboard cannot ask for an unbounded
+/// response and run into Soroban's read-entry or CPU limits.
+pub const MAX_BATCH_SIZE: u32 = 50;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,13 +150,50 @@ pub struct ClaimRedeemed {
     pub deposit: i128,
 }
 
+#[contractevent(data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseChanged {
+    #[topic]
+    pub admin: Address,
+    pub paused: bool,
+}
+
+#[contractevent(data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferProposed {
+    #[topic]
+    pub admin: Address,
+    pub new_admin: Address,
+}
+
+#[contractevent(data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCancelled {
+    #[topic]
+    pub admin: Address,
+}
+
+#[contractevent(data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChanged {
+    #[topic]
+    pub old_admin: Address,
+    pub new_admin: Address,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
+    PendingAdmin,
+    Paused,
     DepositToken,
     ClaimCount,
     Claim(u64),
+    /// `(issuer, serial_hash) -> claim_id` while a claim for the physical item
+    /// is still active or awaiting redemption. Removed on redemption so the
+    /// same tag can be reused after the deposit has gone back to the customer.
+    Serial(Address, BytesN<32>),
     Merchant(Address),
     Station(Address, Address),
 }
@@ -173,6 +217,13 @@ pub enum Error {
     InvalidExpiry = 13,
     SameOwner = 14,
     Overflow = 15,
+    NotAdmin = 16,
+    SerialAlreadyActive = 17,
+    ContractPaused = 18,
+    UnexpectedTransferAmount = 19,
+    BatchTooLarge = 20,
+    NoPendingAdmin = 21,
+    SameAdmin = 22,
 }
 
 #[contract]
@@ -203,10 +254,81 @@ impl Looptag {
         Ok(())
     }
 
+    /// Pause or unpause the parts of the protocol that create or redirect
+    /// exposure. Redemption deliberately stays available while paused so an
+    /// emergency stop can never strand a returned item's deposit.
+    pub fn set_paused(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
+        require_admin(&env, &admin)?;
+
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        bump_instance(&env);
+
+        PauseChanged { admin, paused }.publish(&env);
+        Ok(())
+    }
+
+    /// Start a two-step admin handover. The nominated address must call
+    /// `accept_admin`, which prevents a typo from permanently losing control.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
+        require_admin(&env, &admin)?;
+        if admin == new_admin {
+            return Err(Error::SameAdmin);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        bump_instance(&env);
+
+        AdminTransferProposed { admin, new_admin }.publish(&env);
+        Ok(())
+    }
+
+    /// Complete a pending admin handover. Only the nominated address can accept.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdmin)?;
+        if pending != new_admin {
+            return Err(Error::NotAdmin);
+        }
+        new_admin.require_auth();
+
+        let old_admin = load_admin(&env)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump_instance(&env);
+
+        AdminChanged {
+            old_admin,
+            new_admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Cancel a pending handover. Useful when the nominated key is lost before
+    /// it accepts or when the operator changes their mind.
+    pub fn cancel_admin_transfer(env: Env, admin: Address) -> Result<(), Error> {
+        require_admin(&env, &admin)?;
+        if !env.storage().instance().has(&DataKey::PendingAdmin) {
+            return Err(Error::NoPendingAdmin);
+        }
+
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump_instance(&env);
+
+        AdminTransferCancelled { admin }.publish(&env);
+        Ok(())
+    }
+
     /// Register a merchant that is allowed to issue deposit claims.
     pub fn register_merchant(env: Env, merchant: Address, name: String) -> Result<(), Error> {
         let admin = load_admin(&env)?;
         admin.require_auth();
+        require_not_paused(&env)?;
 
         let key = DataKey::Merchant(merchant.clone());
         if env.storage().persistent().has(&key) {
@@ -258,6 +380,7 @@ impl Looptag {
     /// the issuer because the issuer is the party accepting the returned item.
     pub fn register_station(env: Env, issuer: Address, station: Address) -> Result<(), Error> {
         issuer.require_auth();
+        require_not_paused(&env)?;
         let record = load_merchant(&env, &issuer)?;
         if !record.active {
             return Err(Error::MerchantInactive);
@@ -279,6 +402,7 @@ impl Looptag {
     /// Revoke a return station. Already-attested returns remain valid.
     pub fn remove_station(env: Env, issuer: Address, station: Address) -> Result<(), Error> {
         issuer.require_auth();
+        require_not_paused(&env)?;
         let key = DataKey::Station(issuer.clone(), station.clone());
         env.storage().persistent().remove(&key);
 
@@ -301,6 +425,7 @@ impl Looptag {
         expires_at: u64,
     ) -> Result<u64, Error> {
         issuer.require_auth();
+        require_not_paused(&env)?;
 
         if deposit <= 0 {
             return Err(Error::InvalidDeposit);
@@ -316,12 +441,21 @@ impl Looptag {
             return Err(Error::MerchantInactive);
         }
 
+        // A physical tag can only back one live claim per issuer. Check before
+        // moving funds so a duplicate call cannot consume a claim id or deposit.
+        let serial_key = DataKey::Serial(issuer.clone(), serial_hash.clone());
+        if env.storage().persistent().has(&serial_key) {
+            return Err(Error::SerialAlreadyActive);
+        }
+
         let token = load_deposit_token(&env)?;
-        token::Client::new(&env, &token).transfer(
+        transfer_exact(
+            &env,
+            &token,
             &issuer,
-            env.current_contract_address(),
-            &deposit,
-        );
+            &env.current_contract_address(),
+            deposit,
+        )?;
 
         let id = next_claim_id(&env)?;
         let claim = Claim {
@@ -340,6 +474,9 @@ impl Looptag {
         let claim_key = DataKey::Claim(id);
         env.storage().persistent().set(&claim_key, &claim);
         bump_persistent(&env, &claim_key);
+
+        env.storage().persistent().set(&serial_key, &id);
+        bump_persistent(&env, &serial_key);
 
         merchant.issued = merchant.issued.checked_add(1).ok_or(Error::Overflow)?;
         merchant.outstanding = merchant
@@ -371,6 +508,7 @@ impl Looptag {
         to: Address,
     ) -> Result<(), Error> {
         from.require_auth();
+        require_not_paused(&env)?;
 
         let key = DataKey::Claim(claim_id);
         let mut claim = load_claim(&env, claim_id)?;
@@ -402,6 +540,7 @@ impl Looptag {
         serial_hash: BytesN<32>,
     ) -> Result<(), Error> {
         station.require_auth();
+        require_not_paused(&env)?;
 
         let key = DataKey::Claim(claim_id);
         let mut claim = load_claim(&env, claim_id)?;
@@ -440,18 +579,24 @@ impl Looptag {
             return Err(Error::ClaimNotReturnAuthorized);
         }
 
-        // Checks-effects-interactions: freeze the claim before moving funds so
-        // a re-entrant call cannot redeem twice.
+        // Checks-effects-interactions: freeze the claim and release the serial
+        // index before moving funds so a re-entrant call cannot redeem twice.
+        // Soroban rolls the whole invocation back if the transfer check fails.
         claim.status = ClaimStatus::Redeemed;
         env.storage().persistent().set(&key, &claim);
         bump_persistent(&env, &key);
 
+        let serial_key = DataKey::Serial(claim.issuer.clone(), claim.serial_hash.clone());
+        env.storage().persistent().remove(&serial_key);
+
         let token = load_deposit_token(&env)?;
-        token::Client::new(&env, &token).transfer(
+        transfer_exact(
+            &env,
+            &token,
             &env.current_contract_address(),
             &claim.owner,
-            &claim.deposit,
-        );
+            claim.deposit,
+        )?;
 
         let mut merchant = load_merchant(&env, &claim.issuer)?;
         merchant.outstanding = merchant
@@ -480,6 +625,14 @@ impl Looptag {
         load_admin(&env)
     }
 
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    pub fn get_paused(env: Env) -> bool {
+        is_paused(&env)
+    }
+
     pub fn get_deposit_token(env: Env) -> Result<Address, Error> {
         load_deposit_token(&env)
     }
@@ -502,6 +655,29 @@ impl Looptag {
         Ok(claim)
     }
 
+    /// Read a bounded list of claims in one call. The limit protects the
+    /// contract from unbounded return values and makes dashboard pagination
+    /// predictable.
+    pub fn get_claims(env: Env, claim_ids: Vec<u64>) -> Result<Vec<Claim>, Error> {
+        if claim_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let mut claims = Vec::new(&env);
+        for claim_id in claim_ids.iter() {
+            claims.push_back(load_claim(&env, claim_id)?);
+        }
+        Ok(claims)
+    }
+
+    /// Return the live claim id for an `(issuer, serial_hash)` pair, if any.
+    /// This is the same index used to reject duplicate active tags.
+    pub fn get_serial_claim(env: Env, issuer: Address, serial_hash: BytesN<32>) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Serial(issuer, serial_hash))
+    }
+
     pub fn get_merchant(env: Env, merchant: Address) -> Result<Merchant, Error> {
         load_merchant(&env, &merchant)
     }
@@ -518,6 +694,61 @@ impl Looptag {
 // -------------------------------------------------------------------------
 // Internal helpers
 // -------------------------------------------------------------------------
+
+fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+    let stored = load_admin(env)?;
+    if &stored != admin {
+        return Err(Error::NotAdmin);
+    }
+    admin.require_auth();
+    Ok(())
+}
+
+fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+fn require_not_paused(env: &Env) -> Result<(), Error> {
+    if is_paused(env) {
+        return Err(Error::ContractPaused);
+    }
+    Ok(())
+}
+
+/// Transfer exactly `amount` and reject tokens that burn, withhold, or mint a
+/// fee on the way. Soroban reverts the whole invocation if this returns an
+/// error, so a non-standard token cannot leave a partially funded claim.
+fn transfer_exact(
+    env: &Env,
+    token: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> Result<(), Error> {
+    if from == to {
+        return Err(Error::UnexpectedTransferAmount);
+    }
+
+    let client = token::Client::new(env, token);
+    let from_before = client.balance(from);
+    let to_before = client.balance(to);
+
+    client.transfer(from, to, &amount);
+
+    let from_after = client.balance(from);
+    let to_after = client.balance(to);
+
+    let from_delta = from_before.checked_sub(from_after).ok_or(Error::Overflow)?;
+    let to_delta = to_after.checked_sub(to_before).ok_or(Error::Overflow)?;
+
+    if from_delta != amount || to_delta != amount {
+        return Err(Error::UnexpectedTransferAmount);
+    }
+    Ok(())
+}
 
 fn bump_instance(env: &Env) {
     env.storage()

@@ -16,7 +16,7 @@ Official references:
 
 - [x] Public-ready repository content (contract, SDK, docs, demo, CI).
 - [x] Soroban contract deployed on testnet with a full lifecycle.
-- [x] 15 Rust tests and 18 TypeScript tests passing.
+- [x] 26 Rust tests (including a proptest model) and 33 TypeScript tests passing.
 - [x] 22 scoped issues drafted in [`scripts/issues.json`](../scripts/issues.json).
 - [x] Labels and idempotent issue-creation script prepared.
 - [ ] GitHub repository created and pushed.
@@ -176,8 +176,9 @@ Short version:
 > merchant locks a SEP-41 deposit and issues a transferable claim; a return
 > station attests the physical return with a serial-hash check; anyone can then
 > trigger redemption to the current owner. v0 is live on testnet with a full
-> issue → transfer → return → redeem trail, 15 Rust tests, 18 SDK tests, CI, and
-> 22 scoped issues across the contract, SDK, indexer, demo, and docs.
+> issue → transfer → return → redeem trail, 26 Rust tests (including a
+> proptest model), 33 SDK tests, CI, and 22 scoped issues across the contract,
+> SDK, indexer, demo, and docs.
 
 Do not claim an audit, mainnet readiness, or a trustless physical-return proof.
 The honest scope is stronger than an inflated one.

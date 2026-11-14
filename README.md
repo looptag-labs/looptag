@@ -16,10 +16,13 @@ wallet that originally paid.
 The result is a deposit that behaves like money while the item is out in the
 world, instead of a paper token that is easy to lose and hard to redeem.
 
-> **Status:** v0 is deployed on Stellar testnet and has completed a full
-> issue → transfer → return → redeem lifecycle with native XLM. See
-> [testnet evidence](docs/TESTNET_EVIDENCE.md). The demo dashboard is a
-> read-only snapshot; it does not sign transactions.
+> **Status:** v0.1 is deployed on Stellar testnet and has completed a full
+> issue → transfer → return → redeem lifecycle with native XLM. The v0.2
+> contract adds pause controls, two-step admin rotation, per-issuer serial
+> uniqueness, exact-transfer token checks, and bounded batch reads; it is
+> implemented and covered by 26 contract tests, pending a fresh testnet
+> deployment. See [testnet evidence](docs/TESTNET_EVIDENCE.md). The demo
+> dashboard is a read-only snapshot; it does not sign transactions.
 
 ## Why this exists
 
@@ -92,8 +95,8 @@ trust boundaries in [docs/TRUST_MODEL.md](docs/TRUST_MODEL.md).
 
 ```text
 looptag/
-├── contracts/looptag/       Soroban contract (Rust) + 15 unit tests
-├── packages/sdk/            TypeScript SDK, QR format, event decoder + tests
+├── contracts/looptag/       Soroban contract (Rust) + 26 unit/property tests
+├── packages/sdk/            TypeScript SDK, QR format, tx builders, event paging + tests
 ├── demo/                    Static read-only lifecycle dashboard + QR asset
 ├── deployments/testnet.json Machine-readable deployment manifest
 ├── docs/                    Architecture, trust model, threat model, evidence
@@ -177,6 +180,7 @@ import {
   toStroops,
   fromStroops,
   decodeLooptagEvent,
+  buildIssueClaimTx,
 } from "@looptag/sdk";
 
 const client = createClient({
@@ -195,13 +199,25 @@ const payload = encodeClaimQr({
 const scanned = decodeClaimQr(payload); // verifies the checksum
 const deposit = toStroops("2");         // 20000000n (always pass money as a plain decimal string)
 console.log(fromStroops(deposit));      // "2"
+
+// Unsigned transaction builders for the full lifecycle. Sign with the
+// matching Stellar account before submitting to Soroban RPC.
+const issueTx = buildIssueClaimTx({
+  contractId: client.options.contractId,
+  source: "G...issuer...",
+  sequence: "123",
+  owner: "G...customer...",
+  serialHash: scanned.serialHash,
+  deposit,
+});
 ```
 
 The SDK is deliberately small. It contains exact amount handling (pass money as
 a plain decimal string to avoid floating-point rounding), QR
-encoding/decoding, claim state helpers, a typed contract client, and a typed
-event decoder. Transaction-building helpers and an indexer are tracked as
-scoped issues.
+encoding/decoding, claim state helpers, a typed contract client, unsigned
+transaction builders for the issue/transfer/return/redeem flow, and a typed
+event decoder plus one-page RPC event fetch. A persisted indexer/read API is
+tracked as a scoped issue.
 
 ## Security
 

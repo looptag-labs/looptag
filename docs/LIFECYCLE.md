@@ -9,7 +9,7 @@ every public entry point, return type, and event payload, see [API.md](API.md).
 
 | Actor | Role |
 | --- | --- |
-| Admin | registers merchants, suspends merchants, manages the issuer allowlist |
+| Admin | registers merchants, suspends merchants, manages the issuer allowlist, pauses new exposure, rotates admin through a two-step handover |
 | Merchant / issuer | locks the deposit, defines its return stations, issues claims |
 | Customer / owner | holds the claim, can transfer it while active, receives the refund |
 | Return station | attests that a specific physical item was returned |
@@ -42,14 +42,40 @@ A station is scoped to one issuer. The issuer is the party accepting the
 returned item, so it decides which stations it trusts. Revoking a station does
 not invalidate returns that were already attested.
 
+```text
+set_paused(admin, paused)               [admin auth]
+  → Paused = paused
+  → event: pause_changed(admin, paused)
+
+propose_admin(admin, new_admin)         [admin auth]
+  → PendingAdmin = new_admin
+  → event: admin_transfer_proposed(admin, new_admin)
+
+accept_admin(new_admin)                 [new_admin auth]
+  → Admin = new_admin, PendingAdmin removed
+  → event: admin_changed(old_admin, new_admin)
+
+cancel_admin_transfer(admin)            [admin auth]
+  → PendingAdmin removed
+  → event: admin_transfer_cancelled(admin)
+```
+
+Pausing stops merchant and station registration, new issuance, transfers, and
+return attestation. Redemption stays open, so a pause can never strand a deposit
+for an item that has already been returned. Admin handover requires the new
+address to accept with its own signature; a mistaken address can be cancelled
+before it accepts.
+
 ## Step 1 — issue a claim
 
 ```text
 issue_claim(issuer, owner, serial_hash, deposit, expires_at)   [issuer auth]
+  → not paused
   → deposit > 0
   → expires_at == 0 or expires_at > now
   → merchant exists and is active
-  → token.transfer(issuer, contract, deposit)
+  → no live claim already uses this (issuer, serial_hash)
+  → token.transfer(issuer, contract, deposit) moves exactly deposit
   → Claim {
       id: next id,
       owner,
@@ -61,6 +87,7 @@ issue_claim(issuer, owner, serial_hash, deposit, expires_at)   [issuer auth]
       return_station: None,
       returned_at: 0,
     }
+  → Serial(issuer, serial_hash) = id
   → merchant.issued += 1
   → merchant.outstanding += deposit
   → event: claim_issued(id, issuer, owner, deposit, serial_hash, expires_at)
@@ -70,10 +97,18 @@ The serial hash is `SHA-256(serial)`. The raw serial is not stored on-chain. The
 issuer is responsible for printing a QR tag that binds the claim id, contract,
 network, and serial hash. See [QR_FORMAT.md](QR_FORMAT.md).
 
+The serial index is checked before funds move. A duplicate active tag returns
+`SerialAlreadyActive` without consuming a claim id or transferring a deposit.
+The index survives a transfer and is removed only on redemption, after which
+the same tag can back a new claim. The deposit token must move exactly the
+requested amount; fee-on-transfer or non-standard tokens are rejected
+atomically with `UnexpectedTransferAmount`.
+
 ## Step 2 — transfer the claim
 
 ```text
 transfer_claim(claim_id, from, to)       [from auth]
+  → not paused
   → claim.status == Active
   → claim.owner == from
   → from != to
@@ -92,6 +127,7 @@ refund by transferring the claim.
 
 ```text
 authorize_return(claim_id, station, serial_hash)   [station auth]
+  → not paused
   → claim.status == Active
   → claim.serial_hash == serial_hash
   → Station(claim.issuer, station) == true
@@ -111,10 +147,11 @@ issuer's allowlist is rejected.
 ## Step 4 — redeem the deposit
 
 ```text
-redeem(claim_id)                         [no auth required]
+redeem(claim_id)                         [no auth required, works while paused]
   → claim.status == ReturnAuthorized
   → claim.status = Redeemed                 (effects before interaction)
-  → token.transfer(contract, claim.owner, claim.deposit)
+  → Serial(issuer, serial_hash) removed
+  → token.transfer(contract, claim.owner, claim.deposit) moves exactly deposit
   → merchant.outstanding -= claim.deposit
   → merchant.redeemed += 1
   → event: claim_redeemed(id, owner, deposit)
@@ -122,7 +159,9 @@ redeem(claim_id)                         [no auth required]
 
 Redemption is permissionless. Anyone can pay the network fee to trigger it, but
 the contract can only pay the current owner. This prevents a station, relayer, or
-merchant from redirecting the refund after attestation.
+merchant from redirecting the refund after attestation. Freezing the claim and
+releasing the serial index before the transfer also prevents a re-entrant
+redemption from paying twice.
 
 The claim record is kept forever as an audit trail. The deposit is gone, but the
 history remains queryable.
@@ -146,6 +185,13 @@ history remains queryable.
 | 13 | `InvalidExpiry` | expiry is in the past |
 | 14 | `SameOwner` | transfer to the current owner |
 | 15 | `Overflow` | counter or liability overflow |
+| 16 | `NotAdmin` | caller is not the stored or nominated admin |
+| 17 | `SerialAlreadyActive` | issuer already has a live claim for this serial |
+| 18 | `ContractPaused` | exposure-changing action attempted while paused |
+| 19 | `UnexpectedTransferAmount` | deposit token did not move exactly the amount |
+| 20 | `BatchTooLarge` | `get_claims` requested more than 50 ids |
+| 21 | `NoPendingAdmin` | accept/cancel with no handover pending |
+| 22 | `SameAdmin` | proposed admin is already current |
 
 ## Invariants
 
@@ -158,7 +204,16 @@ history remains queryable.
 6. A suspended merchant cannot issue new claims, but existing claims remain
    transferable and redeemable.
 7. The contract never holds more of the deposit token than the sum of all
-   outstanding liabilities (assuming the token behaves normally).
+   outstanding liabilities, and every transfer moves exactly the requested
+   amount.
+8. At most one live claim exists per `(issuer, serial_hash)`. The serial index
+   survives transfers and is released only on redemption.
+9. Pausing blocks every operation that creates or redirects exposure, but never
+   blocks redemption.
+10. Admin can only change through `propose_admin` followed by a signature from
+    the nominated address; the current admin can cancel a pending handover.
 
-Invariant 5 and 7 are exercised by the unit tests and should be extended with
-property tests as described in the issue backlog.
+Invariants 5, 7, and 8 are exercised by the unit tests. A `proptest` model runs
+randomized issue/transfer/return/redeem sequences and checks that the contract
+token balance and merchant liability always equal the sum of unredeemed
+deposits, and that the serial index agrees with the live claims.
