@@ -174,19 +174,25 @@ signing is tracked in the issue backlog.
 
 ```ts
 import {
-  createClient,
-  encodeClaimQr,
-  decodeClaimQr,
-  toStroops,
-  fromStroops,
-  decodeLooptagEvent,
+  LooptagError,
+  authorizeReturn,
   buildIssueClaimTx,
+  createClient,
+  decodeClaimQr,
+  decodeLooptagEvent,
+  encodeClaimQr,
+  fromStroops,
+  issueClaim,
+  redeem,
+  toStroops,
+  transferClaim,
 } from "@looptag/sdk";
 
 const client = createClient({
   contractId: "CCTM224EKYEXNSULQBEW2HRG5CICUWWE46MLSRSASJZUQKXI5E5LK5GT",
   networkPassphrase: "Test SDF Network ; September 2015",
   rpcUrl: "https://soroban-testnet.stellar.org",
+  publicKey: "G...issuer...",
 });
 
 const payload = encodeClaimQr({
@@ -200,8 +206,49 @@ const scanned = decodeClaimQr(payload); // verifies the checksum
 const deposit = toStroops("2");         // 20000000n (always pass money as a plain decimal string)
 console.log(fromStroops(deposit));      // "2"
 
-// Unsigned transaction builders for the full lifecycle. Sign with the
-// matching Stellar account before submitting to Soroban RPC.
+// 1. Simulate -> sign -> send with the generated client helpers.
+// Inputs are validated locally, `serial` is hashed via SHA-256 into a 32-byte
+// Buffer, and failed simulations throw a typed `LooptagError` with `err.code`.
+try {
+  const assembled = await issueClaim(client, {
+    issuer: "G...issuer...",
+    owner: "G...customer...",
+    serial: "CUP-042",
+    deposit,
+  });
+
+  // Key custody stays outside the SDK: sign with Freighter / wallet / signer
+  // and submit the simulated `AssembledTransaction`.
+  const sent = await assembled.signAndSend({
+    signTransaction: async (xdr) => wallet.signTransaction(xdr),
+  });
+  const claimId = sent.result.unwrap();
+
+  // Subsequent lifecycle steps follow the same simulate -> signAndSend flow:
+  const transferAssembled = await transferClaim(client, {
+    claimId,
+    from: "G...customer...",
+    to: "G...friend...",
+  });
+  await transferAssembled.signAndSend({ signTransaction: customerSign });
+
+  const returnAssembled = await authorizeReturn(client, {
+    claimId,
+    station: "G...station...",
+    serial: "CUP-042",
+  });
+  await returnAssembled.signAndSend({ signTransaction: stationSign });
+
+  const redeemAssembled = await redeem(client, { claimId });
+  await redeemAssembled.signAndSend({ signTransaction: relayerSign });
+} catch (err) {
+  if (err instanceof LooptagError) {
+    console.error(`Contract error #${err.code} (${err.errorName}): ${err.message}`);
+  }
+}
+
+// 2. Low-level unsigned XDR builders are also available when managing sequence
+// numbers and Soroban simulation manually:
 const issueTx = buildIssueClaimTx({
   contractId: client.options.contractId,
   source: "G...issuer...",
@@ -214,10 +261,11 @@ const issueTx = buildIssueClaimTx({
 
 The SDK is deliberately small. It contains exact amount handling (pass money as
 a plain decimal string to avoid floating-point rounding), QR
-encoding/decoding, claim state helpers, a typed contract client, unsigned
-transaction builders for the issue/transfer/return/redeem flow, and a typed
-event decoder plus one-page RPC event fetch. A persisted indexer/read API is
-tracked as a scoped issue.
+encoding/decoding, claim state helpers, a typed contract client, simulated
+lifecycle helpers (`issueClaim`, `transferClaim`, `authorizeReturn`, `redeem`)
+with contract error decoding, unsigned transaction builders, and a typed event
+decoder plus one-page RPC event fetch. A persisted indexer/read API is tracked
+as a scoped issue.
 
 ## Security
 
