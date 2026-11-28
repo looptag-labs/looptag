@@ -10,8 +10,8 @@ description = "Deposit-backed, transferable claims for reusable physical assets 
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = "27.0.6"
+soroban-sdk = "30.0.0"
 
 [dev-dependencies]
-soroban-sdk = { version = "27.0.6", features = ["testutils"] }
+soroban-sdk = { version = "30.0.0", features = ["testutils"] }
 proptest = "1.6"
